@@ -1,0 +1,18 @@
+
+services:
+  backend:
+    build: ./backend
+    container_name: image-backend
+    expose:
+      - "8000"
+    # If you want logs+restarts:
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: image-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

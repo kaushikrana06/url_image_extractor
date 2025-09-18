@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Page background */
+body {
+  @apply bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-100;
+  min-height: 100vh;
+}
+
+/* Glass card */
+.card {
+  @apply backdrop-blur-xl bg-white/10 border border-white/10 rounded-2xl shadow-2xl;
+}
+
+/* Animated gradient border for the dropzone */
+.drop-outer {
+  position: relative;
+  border-radius: 1rem;
+  padding: 2px;
+  background: linear-gradient(120deg, #16c28b, #8b5cf6, #22d3ee, #16c28b);
+  background-size: 300% 300%;
+  animation: borderShift 6s ease infinite;
+}
+@keyframes borderShift {
+  0% { background-position: 0% 50% }
+  50% { background-position: 100% 50% }
+  100% { background-position: 0% 50% }
+}
+
+/* Indeterminate progress */
+.progress::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent);
+  width: 40%;
+  animation: shimmer 1.2s infinite;
+}
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
