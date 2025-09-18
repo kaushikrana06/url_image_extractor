@@ -2,6 +2,7 @@ import React, { useCallback, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Download, UploadCloud, CheckCircle2, Link as LinkIcon, Clipboard, ClipboardCheck, AlertTriangle } from "lucide-react";
 
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
 type FailedItem = { sheet: string; name: string; url: string };
 
 function classNames(...c: (string | false | null | undefined)[]) {
@@ -43,8 +44,9 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("file", file);
+      const endpoint = `${API_BASE ? API_BASE : ""}/api/upload`;
+      const res = await fetch(endpoint, { method: "POST", body: form });
 
-      const res = await fetch("/api/upload", { method: "POST", body: form });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Server error (${res.status})`);
