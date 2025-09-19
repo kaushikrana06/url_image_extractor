@@ -1,8 +1,9 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Download, UploadCloud, CheckCircle2, Link as LinkIcon, Clipboard, ClipboardCheck, AlertTriangle } from "lucide-react";
+import { Download, UploadCloud, CheckCircle2, Link as LinkIcon, Clipboard, ClipboardCheck, AlertTriangle, LogOut } from "lucide-react";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
+
 type FailedItem = { sheet: string; name: string; url: string };
 
 function classNames(...c: (string | false | null | undefined)[]) {
@@ -10,6 +11,13 @@ function classNames(...c: (string | false | null | undefined)[]) {
 }
 
 export default function App() {
+  // Auth state
+  const [authChecked, setAuthChecked] = useState(false);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginErr, setLoginErr] = useState<string | null>(null);
+
+  // Uploader state
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -17,6 +25,63 @@ export default function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [dragOver, setDragOver] = useState(false);
+
+  // Check current session
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/me`, { credentials: "include" });
+        if (r.ok) {
+          const { email } = await r.json();
+          setUserEmail(email);
+        } else {
+          setUserEmail(null);
+        }
+      } catch {
+        setUserEmail(null);
+      } finally {
+        setAuthChecked(true);
+      }
+    })();
+  }, []);
+
+  // Login with email
+  const doLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginErr(null);
+    const email = loginEmail.trim();
+    if (!email || !email.includes("@")) {
+      setLoginErr("Enter a valid email.");
+      return;
+    }
+    try {
+      const r = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        setUserEmail(j.email || email);
+        setLoginEmail("");
+      } else if (r.status === 403) {
+        setLoginErr("Not authorized. Contact admin for access.");
+      } else if (r.status === 409) {
+        setLoginErr("This email is already active on another device/browser.");
+      } else {
+        const j = await r.json().catch(() => ({}));
+        setLoginErr(j.error || `Login failed (${r.status}).`);
+      }
+    } catch (err: any) {
+      setLoginErr(err.message || "Login failed.");
+    }
+  };
+
+  const doLogout = async () => {
+    await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
+    location.reload();
+  };
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -44,10 +109,12 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const endpoint = `${API_BASE ? API_BASE : ""}/api/upload`;
-      const res = await fetch(endpoint, { method: "POST", body: form });
+
+      const endpoint = `${API_BASE}/api/upload`;
+      const res = await fetch(endpoint, { method: "POST", body: form, credentials: "include" });
 
       if (!res.ok) {
+        if (res.status === 401) throw new Error("Session expired. Please log in again.");
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Server error (${res.status})`);
       }
@@ -97,9 +164,56 @@ export default function App() {
     setTimeout(() => setCopiedKey(null), 1200);
   };
 
+  // ---------- Renders ----------
+  if (!authChecked) {
+    return <div className="min-h-screen flex items-center justify-center bg-slate-950 text-slate-200">Loading…</div>;
+  }
+
+  if (!userEmail) {
+    // Email gate
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-6">
+        <div className="card p-8 sm:p-10 max-w-md w-full text-center">
+          <h1 className="text-3xl font-extrabold tracking-tight">Enter your email</h1>
+          <p className="mt-2 text-slate-300/90">Access is restricted. If not recognized, contact the admin.</p>
+          <form onSubmit={doLogin} className="mt-6 space-y-3">
+            <input
+              type="email"
+              placeholder="you@example.com"
+              value={loginEmail}
+              onChange={(e) => setLoginEmail(e.target.value)}
+              className="w-full rounded-lg bg-slate-900/70 border border-white/10 px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              required
+            />
+            {loginErr && <div className="text-sm text-rose-300">{loginErr}</div>}
+            <button
+              type="submit"
+              className="w-full rounded-lg bg-gradient-to-r from-emerald-500 to-brand-600 px-4 py-2.5 font-semibold text-white hover:brightness-110"
+            >
+              Continue
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // Authenticated UI
   return (
     <div className="px-6 py-10 sm:py-16">
       <div className="mx-auto max-w-5xl">
+        {/* Header with logout */}
+        <div className="flex items-center justify-between">
+          <div />
+          <button
+            onClick={doLogout}
+            className="inline-flex items-center gap-2 text-sm text-slate-300 hover:text-slate-100"
+            title="Sign out"
+          >
+            <LogOut className="h-4 w-4" /> Sign out ({userEmail})
+          </button>
+        </div>
+
         {/* Hero */}
         <motion.div
           initial={{ opacity: 0, y: 12 }}
@@ -197,9 +311,7 @@ export default function App() {
           </form>
 
           {/* Indeterminate progress bar */}
-          {busy && (
-            <div className="relative mt-6 h-2 w-full overflow-hidden rounded-full bg-slate-700/60 progress" />
-          )}
+          {busy && <div className="relative mt-6 h-2 w-full overflow-hidden rounded-full bg-slate-700/60 progress" />}
         </motion.div>
 
         {/* Failed section */}
@@ -212,9 +324,7 @@ export default function App() {
           >
             <div className="flex items-center gap-2 mb-4">
               <AlertTriangle className="h-5 w-5 text-amber-300" />
-              <h2 className="text-lg font-semibold">
-                Failed to download ({failedList.length})
-              </h2>
+              <h2 className="text-lg font-semibold">Failed to download ({failedList.length})</h2>
             </div>
 
             <div className="space-y-6">
@@ -266,7 +376,7 @@ export default function App() {
 
         {/* Footer */}
         <div className="mt-10 text-center text-slate-400/80 text-xs">
-          Built with FastAPI + React • Parallel downloads • Smart ZIP layout
+          Built with FastAPI + React • Email-gated • Single session per email
         </div>
       </div>
     </div>
