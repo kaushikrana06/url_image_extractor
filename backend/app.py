@@ -1,9 +1,9 @@
-# backend/app.py
 import io, os, re, json, base64, zipfile, asyncio, unicodedata
 from typing import List, Optional, Dict, Any, Tuple
 from urllib.parse import urlparse, parse_qs, quote
 from uuid import uuid4
-from datetime import timedelta
+
+from dotenv import load_dotenv
 
 import httpx
 from PIL import Image, UnidentifiedImageError, ImageFile
@@ -14,6 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from openpyxl import load_workbook
 
+# Load env vars from .env file at project root
+load_dotenv()
+
 # Pillow safety
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -22,20 +25,16 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # -----------------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "86400"))  # 24h
-# Initial allowlist (admin can add/remove at runtime via API)
 ALLOWED_EMAILS = {
     e.strip().lower()
     for e in os.getenv("ALLOWED_EMAILS", "").split(",")
     if e.strip()
 }
-# Admin token for allow/revoke endpoints (simple bearer)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "set-an-admin-token")
 
-# Optional CORS (harmless if same-origin single container)
 ALLOWED = os.getenv("CORS_ORIGIN", "*")
 origins = [o.strip() for o in ALLOWED.split(",") if o.strip()]
 
-# Browser-y UA helps some CDNs
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -58,12 +57,9 @@ app.add_middleware(
     max_age=3600,
 )
 
-# Signed cookie (no DB)
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="session-v1")
 
-# One active session per email (in-memory)
 ACTIVE_SESSIONS: Dict[str, str] = {}  # email -> sid
-# Dynamic allowlist (in-memory, seeded from env)
 DYN_ALLOWED: Dict[str, bool] = {e: True for e in ALLOWED_EMAILS}
 
 # -----------------------------------------------------------------------------
@@ -185,6 +181,9 @@ def find_final_col(ws) -> Optional[Tuple[int, int]]:
                 if isinstance(val, str) and val.strip().lower().startswith("final"):
                     return (r, cell.column)
     return None
+def _active_email() -> Optional[str]:
+    """Return the email that currently holds the single global session, if any."""
+    return next(iter(ACTIVE_SESSIONS.keys()), None) if ACTIVE_SESSIONS else None
 
 # -----------------------------------------------------------------------------
 # Session helpers
@@ -217,30 +216,35 @@ def require_user(request: Request) -> str:
 # -----------------------------------------------------------------------------
 @app.post("/auth/login")
 async def email_login(request: Request):
-    """
-    Body JSON: { "email": "user@example.com" }
-    - 200 if allowed and not active elsewhere (sets cookie)
-    - 403 if not allowed
-    - 409 if already active on another device
-    """
     try:
         payload = await request.json()
     except Exception:
         payload = {}
     email = (payload.get("email") or "").strip().lower()
+
+    # Basic email sanity
     if not email or "@" not in email:
         return JSONResponse({"error": "Enter a valid email."}, status_code=400)
 
-    # allowed?
+    # STRICT allowlist only – remove the 'admin@gmail.com' auto-allow behavior
     allowed = DYN_ALLOWED.get(email, False)
     if not allowed:
         return JSONResponse({"error": "Email not authorized. Contact admin."}, status_code=403)
 
-    # already active elsewhere?
-    if email in ACTIVE_SESSIONS:
-        return JSONResponse({"error": "Session already active on another device."}, status_code=409)
+    # Enforce ONE session globally across the whole app
+    active = _active_email()
+    if active is not None:
+        if active == email:
+            # Same user trying to start another session
+            return JSONResponse({"error": "Session already active on another device."}, status_code=409)
+        else:
+            # Different user while someone else is logged in
+            return JSONResponse(
+                {"error": f"Another user ({active}) is currently logged in. Please try again after they logout."},
+                status_code=423,  # Locked
+            )
 
-    # create session
+    # Create the (only) session
     sid = uuid4().hex
     ACTIVE_SESSIONS[email] = sid
     cookie_val = serializer.dumps({"email": email, "sid": sid})
@@ -251,11 +255,12 @@ async def email_login(request: Request):
         cookie_val,
         max_age=SESSION_MAX_AGE,
         httponly=True,
-        secure=True,
-        samesite="lax",
+        secure=True,          
+        samesite="none",
         path="/",
     )
     return resp
+
 
 @app.post("/auth/logout")
 async def email_logout(request: Request):
@@ -303,7 +308,6 @@ async def admin_revoke(request: Request):
     if not email or "@" not in email:
         raise HTTPException(400, "Valid email required")
     DYN_ALLOWED.pop(email, None)
-    # if currently active, force logout
     if email in ACTIVE_SESSIONS:
         ACTIVE_SESSIONS.pop(email, None)
     return {"ok": True, "allowed": sorted(DYN_ALLOWED.keys())}
@@ -353,39 +357,45 @@ async def upload_excel(file: UploadFile = File(...), email: str = Depends(requir
                     continue
                 header_row, col_idx = loc
 
-                plans: List[Tuple[str, List[str]]] = []
-                for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, min_col=col_idx, max_col=col_idx):
+                # Collect (row_index, display_url, fetch_candidates)
+                plans: List[Tuple[int, str, List[str]]] = []
+                for r, row in enumerate(
+                    ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, min_col=col_idx, max_col=col_idx),
+                    start=header_row + 1
+                ):
                     raw = extract_url_from_cell(row[0])
                     if not raw:
                         continue
                     display, candidates = build_fetch_plan(raw)
                     if candidates:
-                        plans.append((display, candidates))
+                        plans.append((r, display, candidates))
+
                 if not plans:
                     continue
 
                 inner_dir = f"{slugify(workbook_name)}/{slugify(sheet_name)}/images"
                 sem = asyncio.Semaphore(10)
-                results = await asyncio.gather(*(fetch_one(client, cand, sem) for _, cand in plans))
+                results = await asyncio.gather(*(fetch_one(client, cand, sem) for _, _, cand in plans))
 
-                seq = 1
-                for (display_url, _), content in zip(plans, results):
+                # Save each successfully-fetched image using the Excel ROW NUMBER
+                for (row_idx, display_url, _), content in zip(plans, results):
                     if not content:
-                        failed.append({"sheet": sheet_name, "url": display_url})
-                        continue             # Do NOT increment seq
+                        failed.append({"sheet": sheet_name, "row": row_idx, "url": display_url})
+                        continue  # skip name for this row
+
                     try:
                         img = Image.open(io.BytesIO(content))
                         if img.mode not in ("RGB", "L"):
                             img = img.convert("RGB")
                         out = io.BytesIO()
                         img.save(out, format="JPEG", quality=95)
-                        name = f"final_image_{seq}.jpg"
-                        zf.writestr(f"{inner_dir}/{name}", out.getvalue())
-                        seq += 1             # Only increment here on success
-                    except (UnidentifiedImageError, Exception):
-                        failed.append({"sheet": sheet_name, "url": display_url})
-                        continue             # Do NOT increment seq
 
+                        # File is named by its Excel row number; gaps are preserved for blank rows
+                        name = f"final_image_{row_idx}.jpg"
+                        zf.writestr(f"{inner_dir}/{name}", out.getvalue())
+                    except (UnidentifiedImageError, Exception):
+                        failed.append({"sheet": sheet_name, "row": row_idx, "url": display_url})
+                        continue
 
         if failed:
             zf.writestr(f"{slugify(workbook_name)}/failed.json", json.dumps(failed, ensure_ascii=False, indent=2))
@@ -403,8 +413,6 @@ async def upload_excel(file: UploadFile = File(...), email: str = Depends(requir
         headers={"Content-Disposition": cd, "X-Failed-Json": failed_b64},
     )
 
-# -----------------------------------------------------------------------------
-# Static UI (served by FastAPI) - mount AFTER API routes
-# -----------------------------------------------------------------------------
+
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
