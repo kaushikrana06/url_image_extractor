@@ -370,22 +370,22 @@ async def upload_excel(file: UploadFile = File(...), email: str = Depends(requir
 
                 seq = 1
                 for (display_url, _), content in zip(plans, results):
-                    name = f"final_image_{seq}.jpg"
                     if not content:
-                        failed.append({"sheet": sheet_name, "name": name, "url": display_url})
-                        seq += 1
-                        continue
+                        failed.append({"sheet": sheet_name, "url": display_url})
+                        continue             # Do NOT increment seq
                     try:
                         img = Image.open(io.BytesIO(content))
                         if img.mode not in ("RGB", "L"):
                             img = img.convert("RGB")
                         out = io.BytesIO()
                         img.save(out, format="JPEG", quality=95)
+                        name = f"final_image_{seq}.jpg"
                         zf.writestr(f"{inner_dir}/{name}", out.getvalue())
+                        seq += 1             # Only increment here on success
                     except (UnidentifiedImageError, Exception):
-                        failed.append({"sheet": sheet_name, "name": name, "url": display_url})
-                    finally:
-                        seq += 1
+                        failed.append({"sheet": sheet_name, "url": display_url})
+                        continue             # Do NOT increment seq
+
 
         if failed:
             zf.writestr(f"{slugify(workbook_name)}/failed.json", json.dumps(failed, ensure_ascii=False, indent=2))
